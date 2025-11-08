@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort" // --sort のためにインポート
+	"sort"
 
 	"go-ObuZen/data"
 
@@ -16,14 +16,13 @@ import (
 var (
 	inputPath  string
 	outputPath string
-	// check01 専用の --sort フラグ用変数
-	sortFlag bool
+	sortFlag   bool
 )
 
 // check01Cmd は 'check01' サブコマンドを定義
 var check01Cmd = &cobra.Command{
 	Use:   "check01",
-	Short: "同じ世帯番号と住定日で前住所が異なるレコードを抽出します。",
+	Short: "同じ世帯・住定日・住定届出日で前住所が異なるレコードを抽出します。",
 	RunE:  runCheck01,
 }
 
@@ -34,16 +33,14 @@ func init() {
 	check01Cmd.Flags().StringVarP(&inputPath, "input", "i", "", "入力CSVファイルのパス (必須)")
 	check01Cmd.MarkFlagRequired("input")
 	check01Cmd.Flags().StringVarP(&outputPath, "output", "o", "output_check01.csv", "結果を出力するCSVファイルのパス")
-
-	// --sort フラグを追加
 	check01Cmd.Flags().BoolVar(&sortFlag, "sort", false, "出力を 世帯番号, 宛名番号 の順でソートします (メモリを消費します)")
 }
 
 // runCheck01 は I/O とロジックの呼び出しを担当
 func runCheck01(cmd *cobra.Command, args []string) error {
-	fmt.Printf("✅ チェック01を開始します: %s -> %s\n", inputPath, outputPath)
+	fmt.Printf("チェック01を開始します: %s -> %s\n", inputPath, outputPath)
 	if sortFlag {
-		fmt.Println("⚠️ --sort オプションが有効です。出力対象の全データをメモリに読み込みます。")
+		fmt.Println("--sort オプションが有効です。出力対象の全データをメモリに読み込みます。")
 	}
 
 	// --- パス 1: キーの特定 ---
@@ -53,24 +50,13 @@ func runCheck01(cmd *cobra.Command, args []string) error {
 	}
 	defer inputFile1.Close()
 
-	// (修正) 1. 変数名を duplicateAddresses に戻す
-	// (findDuplicateKeys は map[string]map[string]bool を返す)
-	duplicateAddresses, err := findDuplicateKeys(inputFile1)
+	problemKeys, err := findProblemGroups(inputFile1)
 	if err != nil {
 		return fmt.Errorf("パス1 (キー特定) エラー: %w", err)
 	}
 
-	// (修正) 2. map[string]bool への変換ロジックをここに追加
-	problemKeys := make(map[string]bool)
-	for key, addresses := range duplicateAddresses {
-		if len(addresses) > 1 {
-			problemKeys[key] = true
-		}
-	}
-
-	// (修正) 3. problemKeys (map[string]bool) の件数で判定
 	if len(problemKeys) == 0 {
-		fmt.Println("ℹ️ チェック条件に該当するレコードは見つかりませんでした。")
+		fmt.Println("チェック条件に該当するレコードは見つかりませんでした。")
 		return nil
 	}
 
@@ -87,13 +73,12 @@ func runCheck01(cmd *cobra.Command, args []string) error {
 	}
 	defer outputFile.Close()
 
-	// (修正) 4. 正しい型 (map[string]bool) の problemKeys を渡す
 	var count int
 	if sortFlag {
-		// ソートする (メモリ消費)
+		// ソートする
 		count, err = extractAndWriteSort(inputFile2, outputFile, problemKeys)
 	} else {
-		// ソートしない (メモリ効率優先)
+		// ソートしない
 		count, err = extractAndWriteStream(inputFile2, outputFile, problemKeys)
 	}
 
@@ -105,53 +90,102 @@ func runCheck01(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// findDuplicateKeys はパス1の処理を行います。
-func findDuplicateKeys(r io.Reader) (map[string]map[string]bool, error) {
+// グループごとの情報を集約する内部構造体
+type groupInfo struct {
+	// (修正) key: 住定届出日, value: (set of 前住所)
+	addressesPerDate map[string]map[string]bool
+	allExcluded      bool
+}
+
+// findProblemGroups はパス1の処理を行います
+func findProblemGroups(r io.Reader) (map[string]bool, error) {
 	csvReader := csv.NewReader(r)
 	csvReader.Comma = ','
 
-	duplicateAddresses := make(map[string]map[string]bool)
+	// key: 世帯番号 + "_" + 住定日, value: groupInfo
+	groupMap := make(map[string]*groupInfo)
 
 	for {
 		row, err := csvReader.Read()
 		if err == io.EOF {
 			break
 		}
-
 		if errors.Is(err, csv.ErrFieldCount) {
 			continue
 		}
-
 		if err != nil {
 			return nil, fmt.Errorf("CSV読み取りエラー: %w", err)
 		}
 
-		if len(row) < 4 {
+		// 新レイアウト: 0:宛名, 1:世帯, 2:住定日, 3:住定届出日, 4:前住所, 5:出力有無
+		if len(row) < 6 {
+			continue
+		}
+		setaiBango := row[1]
+		juteiHi := row[2]
+		juteiTodokeHi := row[3] // 新しい列
+		motoJusho := row[4]
+		outputFlag := row[5]
+
+		key := setaiBango + "_" + juteiHi // グループ化キーは変更なし
+
+		info, ok := groupMap[key]
+		if !ok {
+			// このグループの最初のレコード
+			info = &groupInfo{
+				addressesPerDate: make(map[string]map[string]bool),
+				allExcluded:      true,
+			}
+			groupMap[key] = info
+		}
+
+		// (修正) 住定届出日ごとに、前住所のセットを記録
+		if _, ok := info.addressesPerDate[juteiTodokeHi]; !ok {
+			info.addressesPerDate[juteiTodokeHi] = make(map[string]bool)
+		}
+		info.addressesPerDate[juteiTodokeHi][motoJusho] = true
+
+		// 1件でも「出力対象外」で *ない* ものがあれば、フラグをfalseにする
+		if outputFlag != "出力対象外" {
+			info.allExcluded = false
+		}
+	}
+
+	// パス1の集計結果から、問題のあるグループキー (map[string]bool) を作成
+	problemGroups := make(map[string]bool)
+	for key, info := range groupMap {
+		// グループ全員が「出力対象外」の場合はスキップ
+		if info.allExcluded {
 			continue
 		}
 
-		key := row[1] + "_" + row[2] // [1]:世帯番号, [2]:住定日
-		motoJusho := row[3]          // [3]:前住所
-
-		if _, ok := duplicateAddresses[key]; !ok {
-			duplicateAddresses[key] = make(map[string]bool)
+		// このグループ内の「住定届出日」ごとに前住所のバリエーションをチェック
+		isProblem := false
+		for _, addresses := range info.addressesPerDate {
+			// (解釈) 同じ住定届出日 (addresses) の中で、前住所が2種類以上あるか
+			if len(addresses) > 1 {
+				isProblem = true
+				break // このグループは問題ありと確定
+			}
 		}
-		duplicateAddresses[key][motoJusho] = true
+
+		if isProblem {
+			problemGroups[key] = true
+		}
 	}
-	return duplicateAddresses, nil
+
+	return problemGroups, nil
 }
 
 // extractAndWriteStream は、--sort がない場合のデフォルトの動作 (メモリ効率優先)
 func extractAndWriteStream(in io.Reader, out io.Writer, problemKeys map[string]bool) (int, error) {
 	csvReader := csv.NewReader(in)
 	csvReader.Comma = ','
-
 	csvWriter := csv.NewWriter(out)
 	csvWriter.Comma = ','
 
-	// 出力ファイルにはヘッダーを書き込む
+	// 出力ヘッダーも新しいレイアウトに合わせる (data.Headerを変更)
 	if err := csvWriter.Write(data.Header); err != nil {
-		// Write は error を返すので、ここでチェック
 		return 0, fmt.Errorf("出力ヘッダーの書き込みエラー: %w", err)
 	}
 
@@ -161,24 +195,20 @@ func extractAndWriteStream(in io.Reader, out io.Writer, problemKeys map[string]b
 		if err == io.EOF {
 			break
 		}
-
 		if errors.Is(err, csv.ErrFieldCount) {
 			continue
 		}
-
 		if err != nil {
 			return 0, fmt.Errorf("CSV読み取りエラー: %w", err)
 		}
 
-		if len(row) < 4 {
+		if len(row) < 6 {
 			continue
 		}
-
-		key := row[1] + "_" + row[2]
+		key := row[1] + "_" + row[2] // キーは複合キー
 
 		if problemKeys[key] {
 			if err := csvWriter.Write(row); err != nil {
-				// Write は error を返すので、ここでチェック
 				return recordsWritten, fmt.Errorf("CSV書き込みエラー: %w", err)
 			}
 			recordsWritten++
@@ -197,7 +227,6 @@ func extractAndWriteStream(in io.Reader, out io.Writer, problemKeys map[string]b
 func extractAndWriteSort(in io.Reader, out io.Writer, problemKeys map[string]bool) (int, error) {
 	csvReader := csv.NewReader(in)
 	csvReader.Comma = ','
-
 	var results [][]string
 
 	for {
@@ -211,11 +240,11 @@ func extractAndWriteSort(in io.Reader, out io.Writer, problemKeys map[string]boo
 		if err != nil {
 			return 0, fmt.Errorf("CSV読み取りエラー: %w", err)
 		}
-		if len(row) < 4 {
+
+		if len(row) < 6 {
 			continue
 		}
-
-		key := row[1] + "_" + row[2]
+		key := row[1] + "_" + row[2] // キーは複合キー
 
 		if problemKeys[key] {
 			rowCopy := make([]string, len(row))
@@ -224,7 +253,7 @@ func extractAndWriteSort(in io.Reader, out io.Writer, problemKeys map[string]boo
 		}
 	}
 
-	// ソート処理 (世帯番号[1] -> 宛名番号[0])
+	// ソート処理 (世帯番号[1] -> 宛名番号[0]) (変更なし)
 	sort.Slice(results, func(i, j int) bool {
 		if results[i][1] != results[j][1] {
 			return results[i][1] < results[j][1]
@@ -239,7 +268,6 @@ func extractAndWriteSort(in io.Reader, out io.Writer, problemKeys map[string]boo
 	if err := csvWriter.Write(data.Header); err != nil {
 		return 0, fmt.Errorf("出力ヘッダーの書き込みエラー: %w", err)
 	}
-
 	if err := csvWriter.WriteAll(results); err != nil {
 		return len(results), fmt.Errorf("CSV一括書き込み/Flushエラー: %w", err)
 	}

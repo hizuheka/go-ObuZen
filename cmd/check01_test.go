@@ -6,73 +6,88 @@ import (
 	"strings"
 	"testing"
 
-	"go-ObuZen/data"
+	"go-ObuZen/data" // (修正) パッケージパス
 )
 
-// === TestFindDuplicateKeys ===
-// (変更なし)
-func TestFindDuplicateKeys(t *testing.T) {
+// === (修正) TestFindProblemGroups ===
+func TestFindProblemGroups(t *testing.T) {
+	// (修正) 6列のテストケース (0:宛名, 1:世帯, 2:住定日, 3:住定届出日, 4:前住所, 5:出力有無)
 	testCases := []struct {
-		name     string
-		inputCSV string
-		wantKeys []string
-		wantErr  bool
+		name     string   // テストケース名
+		inputCSV string   // 入力CSVデータ (ヘッダーなし)
+		wantKeys []string // 期待する問題キー (世帯番号_住定日)
+		wantErr  bool     // エラーを期待するか
 	}{
 		{
-			name: "正常: 1件の重複 (世帯1)",
+			name: "正常: 問題あり (同一届出日で前住所不一致)",
 			inputCSV: `
-A001,世帯1,2025-01-01,住所A
-A002,世帯1,2025-01-01,住所B
-A003,世帯2,2025-01-01,住所C
-A004,世帯2,2025-01-01,住所C
+A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象
+A002,世帯1,2025-01-01,2025-01-10,住所B,出力対象
 `,
 			wantKeys: []string{"世帯1_2025-01-01"},
 			wantErr:  false,
 		},
 		{
-			name: "正常: 列が足りない (スキップされる)",
+			name: "正常: 問題なし (異なる届出日で前住所不一致)",
 			inputCSV: `
-A001,世帯1,2025-01-01,住所A
-A002,世帯1,2025-01-01,住所B
-A003,世帯1,2025-01-01
+A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象
+A002,世帯1,2025-01-01,2025-01-11,住所B,出力対象
 `,
-			wantKeys: []string{"世帯1_2025-01-01"},
+			wantKeys: []string{}, // 届出日が異なるためOK
 			wantErr:  false,
 		},
 		{
-			name: "正常: フィールド数が不正 (ErrFieldCount, スキップされる)",
+			name: "正常: 問題あり (複数の届出日が混在し、片方が不一致)",
 			inputCSV: `
-A001,世帯1,2025-01-01,住所A
-A002,世帯1,2025-01-01,住所B,"余分な列"
-A003,世帯2,2025-01-01,住所C
+A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象
+A002,世帯1,2025-01-01,2025-01-10,住所B,出力対象
+A003,世帯1,2025-01-01,2025-01-11,住所C,出力対象
+`,
+			wantKeys: []string{"世帯1_2025-01-01"}, // 01-10 のグループがNG
+			wantErr:  false,
+		},
+		{
+			name: "除外: 問題ありだが、全て出力対象外",
+			inputCSV: `
+A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象外
+A002,世帯1,2025-01-01,2025-01-10,住所B,出力対象外
+`,
+			wantKeys: []string{}, // グループ自体が除外
+			wantErr:  false,
+		},
+		{
+			name: "正常: 問題あり (一部出力対象外)",
+			inputCSV: `
+A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象
+A002,世帯1,2025-01-01,2025-01-10,住所B,出力対象外
+`,
+			wantKeys: []string{"世帯1_2025-01-01"}, // グループはチェック対象
+			wantErr:  false,
+		},
+		{
+			name: "正常: 問題なし (同一届出日で前住所一致)",
+			inputCSV: `
+A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象
+A002,世帯1,2025-01-01,2025-01-10,住所A,出力対象
 `,
 			wantKeys: []string{},
 			wantErr:  false,
-		},
-		{
-			name:     "異常系: CSVフォーマット不正 (クォート)",
-			inputCSV: `A001,"世帯1,2025-01-01,住所A`,
-			wantKeys: nil,
-			wantErr:  true,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := strings.NewReader(strings.TrimSpace(tc.inputCSV))
-			duplicateAddresses, err := findDuplicateKeys(r)
+
+			problemKeys, err := findProblemGroups(r)
+
 			if (err != nil) != tc.wantErr {
-				t.Fatalf("findDuplicateKeys() error = %v, wantErr %v", err, tc.wantErr)
+				t.Fatalf("findProblemGroups() error = %v, wantErr %v", err, tc.wantErr)
 			}
 			if tc.wantErr {
 				return
 			}
-			problemKeys := make(map[string]bool)
-			for key, addresses := range duplicateAddresses {
-				if len(addresses) > 1 {
-					problemKeys[key] = true
-				}
-			}
+
 			if len(problemKeys) != len(tc.wantKeys) {
 				t.Errorf("キーの数が異なります。 got = %v, wantKeys = %v", problemKeys, tc.wantKeys)
 			}
@@ -86,22 +101,24 @@ A003,世帯2,2025-01-01,住所C
 }
 
 // === TestExtractAndWriteStream (ソートなし) ===
-// (変更なし)
 func TestExtractAndWriteStream(t *testing.T) {
+	// (修正) 6列のCSV
 	const inputCSV = `
-A001,世帯1,2025-01-01,住所A
-C001,世帯3,2025-02-02,東京
-B001,世帯1,2025-01-01,住所B
+A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象
+C001,世帯3,2025-02-02,2025-02-10,東京,出力対象
+B001,世帯1,2025-01-01,2025-01-10,住所B,出力対象外
 `
+	// (修正) data.Header は data/record.go の6列定義を参照
 	header := strings.Join(data.Header, ",") + "\n"
 	problemKeys := map[string]bool{
 		"世帯1_2025-01-01": true,
 		"世帯3_2025-02-02": true,
 	}
 
-	wantOutput := header + `A001,世帯1,2025-01-01,住所A
-C001,世帯3,2025-02-02,東京
-B001,世帯1,2025-01-01,住所B
+	// (修正) 6列の出力
+	wantOutput := header + `A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象
+C001,世帯3,2025-02-02,2025-02-10,東京,出力対象
+B001,世帯1,2025-01-01,2025-01-10,住所B,出力対象外
 `
 	r := strings.NewReader(strings.TrimSpace(inputCSV))
 	out := new(bytes.Buffer)
@@ -119,22 +136,23 @@ B001,世帯1,2025-01-01,住所B
 }
 
 // === TestExtractAndWriteSort (ソートあり) ===
-// (変更なし)
 func TestExtractAndWriteSort(t *testing.T) {
+	// (修正) 6列のCSV
 	const inputCSV = `
-C001,世帯3,2025-02-02,東京
-B001,世帯1,2025-01-01,住所B
-A001,世帯1,2025-01-01,住所A
-D001,世帯2,2025-01-01,住所C
+C001,世帯3,2025-02-02,2025-02-10,東京,出力対象
+B001,世帯1,2025-01-01,2025-01-10,住所B,出力対象外
+A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象
+D001,世帯2,2025-01-01,2025-01-10,住所C,出力対象
 `
 	header := strings.Join(data.Header, ",") + "\n"
 	problemKeys := map[string]bool{
 		"世帯1_2025-01-01": true,
 		"世帯3_2025-02-02": true,
 	}
-	wantOutput := header + `A001,世帯1,2025-01-01,住所A
-B001,世帯1,2025-01-01,住所B
-C001,世帯3,2025-02-02,東京
+	// (修正) 6列の出力 (ソート順は変わらず)
+	wantOutput := header + `A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象
+B001,世帯1,2025-01-01,2025-01-10,住所B,出力対象外
+C001,世帯3,2025-02-02,2025-02-10,東京,出力対象
 `
 	r := strings.NewReader(strings.TrimSpace(inputCSV))
 	out := new(bytes.Buffer)
@@ -153,29 +171,26 @@ C001,世帯3,2025-02-02,東京
 
 // === I/Oエラーのカバレッジテスト ===
 
-// errorWriterMock は、N回成功した後に書き込みエラーを発生させる io.Writer
+// (errorWriterMock, errorReader は変更なし)
 type errorWriterMock struct {
-	failAfterN int // N回成功した後に失敗
+	failAfterN int
 	writes     int
 }
 
 func (w *errorWriterMock) Write(p []byte) (n int, err error) {
 	if w.writes >= w.failAfterN {
-		return 0, io.ErrShortWrite // 失敗
+		return 0, io.ErrShortWrite
 	}
 	w.writes++
-	return len(p), nil // 成功
+	return len(p), nil
 }
 
-// errorReader は Read 呼び出しで強制的にエラーを返す
 type errorReader struct{}
 
-func (r *errorReader) Read(p []byte) (n int, err error) {
-	return 0, io.ErrUnexpectedEOF
-}
+func (r *errorReader) Read(p []byte) (n int, err error) { return 0, io.ErrUnexpectedEOF }
 
-func TestFindDuplicateKeys_ReadError(t *testing.T) {
-	_, err := findDuplicateKeys(&errorReader{})
+func TestFindProblemGroups_ReadError(t *testing.T) { // (修正) 関数名
+	_, err := findProblemGroups(&errorReader{})
 	if err == nil {
 		t.Fatal("エラーが返されるべきところで、nil が返されました")
 	}
@@ -199,9 +214,9 @@ func TestExtractAndWriteStream_HeaderWriteError(t *testing.T) {
 }
 
 func TestExtractAndWriteStream_RowWriteError(t *testing.T) {
-	// 1回目の書き込み (bufio が Header と Row を結合して Flush) で失敗
 	out := &errorWriterMock{failAfterN: 0}
-	r := strings.NewReader("A001,世帯1,2025-01-01,住所A")
+	// (修正) 6列の入力
+	r := strings.NewReader("A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象")
 	problemKeys := map[string]bool{"世帯1_2025-01-01": true}
 
 	_, err := extractAndWriteStream(r, out, problemKeys)
@@ -228,11 +243,9 @@ func TestExtractAndWriteSort_HeaderWriteError(t *testing.T) {
 }
 
 func TestExtractAndWriteSort_WriteAllError(t *testing.T) {
-	// (修正)
-	// WriteAll がトリガーする Flush/Write が 1回目 であることを考慮し、
-	// failAfterN: 0 に修正する。
 	out := &errorWriterMock{failAfterN: 0}
-	r := strings.NewReader("A001,世帯1,2025-01-01,住所A")
+	// (修正) 6列の入力
+	r := strings.NewReader("A001,世帯1,2025-01-01,2025-01-10,住所A,出力対象")
 	problemKeys := map[string]bool{"世帯1_2025-01-01": true}
 
 	_, err := extractAndWriteSort(r, out, problemKeys)
